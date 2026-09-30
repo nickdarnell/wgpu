@@ -278,6 +278,27 @@ struct MemoryProperties {
 }
 
 impl MemoryProperties {
+    fn upload_memory_type_bits(&self, requirements: &vk::MemoryRequirements, threshold: u8) -> u32 {
+        let preferred = vk::MemoryPropertyFlags::HOST_VISIBLE
+            | vk::MemoryPropertyFlags::HOST_COHERENT
+            | vk::MemoryPropertyFlags::DEVICE_LOCAL;
+        let mut bits = requirements.memory_type_bits;
+        for (index, ty) in self.types().iter().enumerate() {
+            if bits & (1 << index) == 0 || !ty.property_flags.contains(preferred) {
+                continue;
+            }
+            let heap = ty.heap_index as usize;
+            let limit = self.heap_budget()[heap] / 100 * u64::from(threshold);
+            if self.heap_usage()[heap]
+                .checked_add(requirements.size)
+                .is_none_or(|usage| usage >= limit)
+            {
+                bits &= !(1 << index);
+            }
+        }
+        bits
+    }
+
     fn types(&self) -> &[vk::MemoryType] {
         let count = self.base.memory_type_count as usize;
         &self.base.memory_types[0..count]
@@ -1039,6 +1060,21 @@ impl crate::Device for super::Device {
             (false, true) => gpu_allocator::MemoryLocation::CpuToGpu,
             (false, false) => gpu_allocator::MemoryLocation::GpuOnly,
         };
+
+        requirements.memory_type_bits &= self.valid_ash_memory_types;
+        if location == gpu_allocator::MemoryLocation::CpuToGpu {
+            if let (Some(threshold), Some(properties)) = (
+                self.shared
+                    .instance
+                    .memory_budget_thresholds
+                    .for_resource_creation,
+                self.get_memory_properties(),
+            ) {
+                // Let upload allocations fall back from a full device-local heap to host memory.
+                requirements.memory_type_bits =
+                    properties.upload_memory_type_bits(&requirements, threshold);
+            }
+        }
 
         self.error_if_would_oom_on_resource_allocation(location, &requirements)
             .inspect_err(|_| {
@@ -3185,4 +3221,91 @@ impl super::DeviceShared {
 struct ImageWithoutMemory {
     raw: vk::Image,
     requirements: vk::MemoryRequirements,
+}
+
+#[cfg(test)]
+mod memory_budget_tests {
+    use super::*;
+
+    fn properties() -> MemoryProperties {
+        let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let mut base = vk::PhysicalDeviceMemoryProperties {
+            memory_type_count: 3,
+            memory_heap_count: 2,
+            ..Default::default()
+        };
+        base.memory_types[0] = vk::MemoryType {
+            property_flags: host,
+            heap_index: 0,
+        };
+        base.memory_types[1] = vk::MemoryType {
+            property_flags: host | vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            heap_index: 1,
+        };
+        base.memory_types[2] = vk::MemoryType {
+            property_flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            heap_index: 1,
+        };
+        MemoryProperties {
+            base,
+            heap_budget: [10000, 1000].into_iter().collect(),
+            heap_usage: [0, 950].into_iter().collect(),
+        }
+    }
+
+    #[test]
+    fn upload_falls_back_from_full_device_local_heap() {
+        let properties = properties();
+        let requirements = vk::MemoryRequirements {
+            size: 100,
+            alignment: 16,
+            memory_type_bits: 0b111,
+        };
+        assert_eq!(
+            properties.upload_memory_type_bits(&requirements, 100),
+            0b101
+        );
+        // No host-memory fallback may be invented for an incompatible resource.
+        assert_eq!(
+            properties.upload_memory_type_bits(
+                &vk::MemoryRequirements {
+                    memory_type_bits: 0b010,
+                    ..requirements
+                },
+                100
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn upload_keeps_device_local_memory_when_within_budget() {
+        let mut properties = properties();
+        properties.heap_usage[1] = 0;
+        let requirements = vk::MemoryRequirements {
+            size: 100,
+            alignment: 16,
+            memory_type_bits: 0b111,
+        };
+        assert_eq!(
+            properties.upload_memory_type_bits(&requirements, 100),
+            0b111
+        );
+        assert_eq!(properties.upload_memory_type_bits(&requirements, 10), 0b101);
+    }
+
+    #[test]
+    fn upload_budget_arithmetic_cannot_wrap() {
+        let mut properties = properties();
+        properties.heap_usage[1] = u64::MAX;
+        let requirements = vk::MemoryRequirements {
+            size: 100,
+            alignment: 16,
+            memory_type_bits: 0b011,
+        };
+        assert_eq!(
+            properties.upload_memory_type_bits(&requirements, 100),
+            0b001
+        );
+    }
 }

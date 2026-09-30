@@ -42,6 +42,12 @@ Bottom level categories:
 
 ## Unreleased
 
+### Bug Fixes
+
+#### Vulkan
+
+- Allow upload buffers to use compatible host memory when the device-local upload heap exceeds its resource budget.
+
 ### Major changes
 
 #### `TEXTURE_COMPONENT_SWIZZLE` feature and `swizzle` field in `TextureViewDescriptor`
